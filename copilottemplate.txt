@@ -1,0 +1,222 @@
+"""
+Power Automate HTTP Action Templates for Copilot Studio
+=========================================================
+
+These are the exact HTTP request configurations to use in Power Automate
+flows within Microsoft Copilot Studio. Copy these into HTTP action steps.
+
+Recommended approach: Approach 4 (SQL API Async) - works today, no middleware.
+"""
+
+# =============================================================================
+# APPROACH 4: SQL API Async - Power Automate Flow Definition
+# =============================================================================
+
+# Replace these placeholders in all templates below:
+# - <ACCOUNT_URL>: Your Snowflake account URL (e.g., https://orgname-account.snowflakecomputing.com)
+# - <PAT>: Your Programmatic Access Token
+# - <WAREHOUSE>: Your compute warehouse
+# - <DATABASE>: Database containing the agent
+# - <SCHEMA>: Schema containing the agent
+# - <ROLE>: Role with agent access
+# - <USER_QUESTION>: Dynamic content from Copilot Studio trigger
+
+STEP_1_SUBMIT = """
+=== Step 1: HTTP Action - Submit Async Statement ===
+
+Method: POST
+URI: <ACCOUNT_URL>/api/v2/statements
+
+Headers:
+  Authorization: Bearer <PAT>
+  Content-Type: application/json
+  Accept: application/json
+  X-Snowflake-Authorization-Token-Type: PROGRAMMATIC_ACCESS_TOKEN
+
+Body (use Expression to inject the user question dynamically):
+{
+  "statement": "SELECT TRY_PARSE_JSON(SNOWFLAKE.CORTEX.AGENT_RUN($${\\"messages\\": [{\\"role\\": \\"user\\", \\"content\\": [{\\"type\\": \\"text\\", \\"text\\": \\"<USER_QUESTION>\\"}]}], \\"models\\": {\\"orchestration\\": \\"claude-sonnet-4-5\\"}}$$)) AS resp",
+  "timeout": 900,
+  "database": "<DATABASE>",
+  "schema": "<SCHEMA>",
+  "warehouse": "<WAREHOUSE>",
+  "role": "<ROLE>",
+  "resultSetMetaData": {"format": "jsonv2"},
+  "async": true
+}
+
+Expected Response: HTTP 202 Accepted
+Parse JSON body to extract: body('HTTP_Submit')?['statementHandle']
+Store in variable: varStatementHandle
+"""
+
+STEP_2_POLL_LOOP = """
+=== Step 2: Do Until Loop ===
+
+Condition: varPollStatus is not equal to 'complete'
+Limits: Count = 50, Timeout = PT2M (2 minutes)
+
+Inside loop:
+  2a. Delay: 3 seconds
+
+  2b. HTTP Action - Check Status:
+      Method: GET
+      URI: <ACCOUNT_URL>/api/v2/statements/@{variables('varStatementHandle')}
+      Headers:
+        Authorization: Bearer <PAT>
+        Accept: application/json
+        X-Snowflake-Authorization-Token-Type: PROGRAMMATIC_ACCESS_TOKEN
+
+  2c. Condition: outputs('HTTP_Poll')?['statusCode'] equals 200
+      If Yes: Set variable varPollStatus = 'complete'
+      If No: Continue loop (202 means still running)
+"""
+
+STEP_3_PARSE_RESULT = """
+=== Step 3: Parse and Return Result ===
+
+After loop exits, parse the final GET response:
+
+Compose action (Expression):
+  json(body('HTTP_Poll')?['data']?[0]?[0])
+
+This gives you the parsed agent response JSON. Extract the answer:
+
+Compose action (Expression):
+  outputs('Compose_ParsedResponse')?['content']?[0]?['text']
+
+Return this text value to the Copilot Studio user via "Send a message" action.
+"""
+
+# =============================================================================
+# APPROACH 2: Direct Call with Budget - Power Automate (simpler, single HTTP call)
+# =============================================================================
+
+APPROACH_2_SINGLE_CALL = """
+=== Alternative: Single HTTP Call with Budget (Approach 2) ===
+
+Use this if your agent consistently responds within 90 seconds.
+Simpler flow - just one HTTP action, no polling loop.
+
+Method: POST
+URI: <ACCOUNT_URL>/api/v2/databases/<DATABASE>/schemas/<SCHEMA>/agents/<AGENT_NAME>:run
+
+Headers:
+  Authorization: Bearer <PAT>
+  Content-Type: application/json
+  Accept: application/json
+
+Body:
+{
+  "stream": false,
+  "orchestration": {
+    "budget": {
+      "seconds": 90
+    }
+  },
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "<USER_QUESTION>"
+        }
+      ]
+    }
+  ]
+}
+
+Timeout Setting: Set the HTTP action timeout to 100 seconds
+
+Parse Response (Expression):
+  body('HTTP_AgentCall')?['content']?[0]?['text']
+
+Note: If the response is HTTP 200 but content shows status "timed_out",
+the agent hit the budget limit. Return a fallback message to the user.
+"""
+
+# =============================================================================
+# MULTI-TURN CONVERSATION SUPPORT
+# =============================================================================
+
+MULTI_TURN_NOTES = """
+=== Multi-Turn Conversations in Copilot Studio ===
+
+To maintain conversation context across multiple user messages:
+
+1. On first call, capture from response metadata:
+   - thread_id: body('response')?['metadata']?['thread_id']
+   - assistant_message_id: body('response')?['metadata']?['assistant_message_id']
+
+2. Store these in Copilot Studio Topic Variables:
+   - varThreadId (Number)
+   - varParentMessageId (Number)
+
+3. On subsequent calls, include in the request body:
+   {
+     "thread_id": @{variables('varThreadId')},
+     "parent_message_id": @{variables('varParentMessageId')},
+     "messages": [{"role": "user", "content": [...]}],
+     ...
+   }
+
+4. After each response, update varParentMessageId with the new
+   assistant_message_id from the response.
+
+For the SQL API approach (Approach 4), use AGENT_RUN with thread support:
+  SNOWFLAKE.CORTEX.AGENT_RUN($${"thread_id": <ID>, "parent_message_id": <ID>, "messages": [...]}$$, TRUE)
+  The second parameter (TRUE) auto-creates a thread if thread_id is not provided.
+"""
+
+# =============================================================================
+# ERROR HANDLING
+# =============================================================================
+
+ERROR_HANDLING_NOTES = """
+=== Error Handling in Power Automate ===
+
+Common error scenarios and handling:
+
+1. HTTP 422 (Statement error):
+   - Agent encountered a SQL/tool error
+   - Parse body?['message'] for details
+   - Return friendly error to user
+
+2. HTTP 408 / Timeout:
+   - Statement exceeded timeout
+   - Return: "Your question is complex. Please try rephrasing."
+
+3. HTTP 401 / 403:
+   - PAT expired or insufficient privileges
+   - Trigger alert to admin; return generic error to user
+
+4. Loop exceeds 50 iterations:
+   - Agent is taking too long
+   - Return: "Still processing. Please try again in a moment."
+
+5. Error 399500 (background mode not enabled):
+   - Only affects Approach 1
+   - Use Approach 2 or 4 instead
+
+Power Automate "Configure run after" settings:
+  - Set the Parse step to run after HTTP succeeds
+  - Add a parallel branch for "has failed" to return error messages
+  - Use "Scope" actions to group steps and handle errors cleanly
+"""
+
+if __name__ == "__main__":
+    print("=" * 70)
+    print("POWER AUTOMATE TEMPLATES FOR COPILOT STUDIO")
+    print("=" * 70)
+    print(STEP_1_SUBMIT)
+    print(STEP_2_POLL_LOOP)
+    print(STEP_3_PARSE_RESULT)
+    print("\n" + "=" * 70)
+    print("ALTERNATIVE: SINGLE CALL WITH BUDGET")
+    print("=" * 70)
+    print(APPROACH_2_SINGLE_CALL)
+    print("\n" + "=" * 70)
+    print("MULTI-TURN SUPPORT")
+    print("=" * 70)
+    print(MULTI_TURN_NOTES)
